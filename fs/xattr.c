@@ -21,9 +21,6 @@
 #include <linux/audit.h>
 #include <linux/vmalloc.h>
 #include <linux/posix_acl_xattr.h>
-#ifdef CONFIG_NOMOUNT
-#include <linux/nomount.h>
-#endif
 
 #include <linux/uaccess.h>
 #include "internal.h"
@@ -215,12 +212,6 @@ vfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 	struct inode *inode = dentry->d_inode;
 	int error;
 
-#ifdef CONFIG_NOMOUNT
-	int nm_ret = nomount_setxattr_hook(dentry, name, value, size, flags);
-    if (nm_ret != -EOPNOTSUPP)
-        return nm_ret;
-#endif
-
 	error = xattr_permission(inode, name, MAY_WRITE);
 	if (error)
 		return error;
@@ -331,12 +322,6 @@ vfs_getxattr(struct dentry *dentry, const char *name, void *value, size_t size)
 	struct inode *inode = dentry->d_inode;
 	int error;
 	const struct xattr_handler *handler;
-
-#ifdef CONFIG_NOMOUNT
-	ssize_t nm_ret = nomount_getxattr_hook(dentry, name, value, size);
-    if (nm_ret != -EOPNOTSUPP)
-        return nm_ret;
-#endif
 
 	error = xattr_permission(inode, name, MAY_READ);
 	if (error)

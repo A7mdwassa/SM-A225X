@@ -15,10 +15,6 @@
 #endif
 #include "internal.h"
 
-#ifdef CONFIG_NOMOUNT
-#include <linux/nomount.h>
-#endif
-
 static int flags_by_mnt(int mnt_flags)
 {
 	int flags = 0;
@@ -93,11 +89,6 @@ int vfs_statfs(const struct path *path, struct kstatfs *buf)
 	error = statfs_by_dentry(path->dentry, buf);
 	if (!error)
 		buf->f_flags = calculate_f_flags(path->mnt);
-#ifdef CONFIG_NOMOUNT
-	if (!nomount_should_skip())
-		nomount_spoof_statfs(path, buf);
-#endif
-
 	return error;
 #endif
 }

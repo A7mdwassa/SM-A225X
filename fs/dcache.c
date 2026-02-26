@@ -39,9 +39,6 @@
 #include <linux/prefetch.h>
 #include <linux/ratelimit.h>
 #include <linux/list_lru.h>
-#ifdef CONFIG_NOMOUNT
-#include <linux/nomount.h>
-#endif
 #ifdef CONFIG_RUSTUH_KDP_NS
 #include <linux/rustkdp.h>
 #endif
@@ -3325,29 +3322,6 @@ char *d_path(const struct path *path, char *buf, int buflen)
 	char *res = buf + buflen;
 	struct path root;
 	int error;
-
-#ifdef CONFIG_NOMOUNT
-	const char *v_path;
-	int len;
-
-    if (path->dentry && path->dentry->d_inode && !nomount_should_skip()) {
-		nm_enter();
-        v_path = nomount_get_static_vpath(path->dentry->d_inode);
-
-        if (v_path) {
-            len = strlen(v_path);
-            if (buflen >= len + 1) {
-                res = buf + buflen - 1;
-                *res = '\0';
-                res -= len;
-                memcpy(res, v_path, len);
-				nm_exit();
-                return res;
-            }
-        }
-		nm_exit();
-    }
-#endif
 
 	/*
 	 * We have various synthetic filesystems that never get mounted.  On
