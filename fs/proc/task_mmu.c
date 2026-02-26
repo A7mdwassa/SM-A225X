@@ -20,6 +20,9 @@
 #include <linux/uaccess.h>
 #include <linux/mm_inline.h>
 #include <linux/freezer.h>
+#ifdef CONFIG_NOMOUNT
+#include <linux/nomount.h>
+#endif
 #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)
 #include <linux/susfs_def.h>
 #endif
@@ -412,6 +415,11 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 #endif
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
+#ifdef CONFIG_NOMOUNT
+		if (!nomount_should_skip()) {
+			nomount_spoof_mmap_metadata(inode, &dev, &ino);
+		}
+#endif
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 bypass_orig_flow:
 #endif

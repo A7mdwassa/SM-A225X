@@ -1,0 +1,1330 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/namei.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/dirent.h>
+#include <linux/miscdevice.h>
+#include <linux/cred.h>
+#include <linux/vmalloc.h>
+#include <linux/sched/mm.h>
+#include <linux/statfs.h>
+#include <linux/workqueue.h>
+#include <linux/xattr.h>
+#include <linux/nomount.h> 
+
+atomic_t nomount_enabled = ATOMIC_INIT(0);
+EXPORT_SYMBOL(nomount_enabled);
+#define NOMOUNT_DISABLED() (atomic_read(&nomount_enabled) == 0)
+
+struct linux_dirent {
+    unsigned long   d_ino;
+    unsigned long   d_off;
+    unsigned short  d_reclen;
+    char        d_name[];
+};
+
+static DEFINE_HASHTABLE(nomount_dirs_ht, NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(nomount_uid_ht, NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(nomount_rules_by_vpath, NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(nomount_rules_by_real_ino, NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(nomount_rules_by_v_ino,    NOMOUNT_HASH_BITS);
+static LIST_HEAD(nomount_rules_list);
+static DEFINE_SPINLOCK(nomount_lock);
+static DEFINE_MUTEX(nm_refresh_lock);
+
+static unsigned long nm_ino_adb = 0;
+static unsigned long nm_ino_modules = 0;
+
+/* Critical processes that NoMount should ignore to avoid instability */
+static const char *critical_processes[] = {
+    "init",
+    "ueventd",
+    "vold", 
+    NULL
+};
+
+/* Returns true if the current process should be ignored */
+static bool nomount_is_critical_process(void) {
+    const char **proc_name;
+    const char *comm;
+    
+    if (!current)
+        return true; /* Safe default */
+    
+    comm = current->comm;
+    
+    /* Check against critical process list */
+    for (proc_name = critical_processes; *proc_name != NULL; proc_name++) {
+        if (strcmp(comm, *proc_name) == 0)
+            return true;
+    }
+    
+    /* Always allow kernel threads */
+    if (current->flags & PF_KTHREAD)
+        return true;
+    
+    return false;
+}
+
+bool nomount_should_skip(void) {
+    /* Skip if disabled */
+    if (NOMOUNT_DISABLED())
+        return true;
+    
+    if (nm_is_recursive()) 
+        return true;
+    
+    /* Skip in interrupt/NMI context */
+    if (unlikely(in_interrupt() || in_nmi() || oops_in_progress))
+        return true;
+    
+    /* Skip for critical processes */
+    if (nomount_is_critical_process())
+        return true;
+    
+    /* Skip if current task is NULL or invalid */
+    if (!current)
+        return true;
+
+    if (unlikely(!current->mm || (current->flags & (PF_KTHREAD | PF_EXITING))
+        || !current->nsproxy))
+        return true;
+
+    if (current->flags & PF_MEMALLOC_NOFS) 
+        return true;
+    
+    return false;
+}
+EXPORT_SYMBOL(nomount_should_skip);
+
+bool nomount_should_skip_readlink(void) {
+    /* Skip if disabled */
+    if (NOMOUNT_DISABLED())
+        return true;
+
+    if (nm_is_recursive()) 
+        return true;
+
+    return false;
+}
+EXPORT_SYMBOL(nomount_should_skip_readlink);
+
+static bool nomount_is_uid_blocked(uid_t uid) {
+    struct nomount_uid_node *entry;
+    if (nomount_should_skip()) return false;
+    
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_uid_ht, entry, node, uid) {
+        if (entry->uid == uid) {
+            rcu_read_unlock();
+            return true;
+        }
+    }
+    rcu_read_unlock();
+    return false;
+}
+
+bool nomount_match_path(const char *input_path, const char *rule_path) {
+    const char *prefixes[] = {
+        "/system", 
+        "/vendor", 
+        "/product", 
+        "/system_ext", 
+        NULL
+    };
+    const char **p;
+
+    if (!input_path || !rule_path) return false;
+    if (strcmp(input_path, rule_path) == 0) return true;
+
+    for (p = prefixes; *p != NULL; p++) {
+        size_t len = strlen(*p);
+        if (strncmp(input_path, *p, len) == 0) {
+            if (strcmp(input_path + len, rule_path) == 0) return true;
+        }
+        if (strncmp(rule_path, *p, len) == 0) {
+            if (strcmp(rule_path + len, input_path) == 0) return true;
+        }
+    }
+    return false;
+}
+
+static void nomount_flush_parent(const char *parent_path_str, const char *child_name) {
+    struct path parent_path;
+    struct dentry *child_dentry;
+    struct qstr qname;
+    int err;
+
+    err = kern_path(parent_path_str, LOOKUP_FOLLOW, &parent_path);
+    if (err) return;
+
+    qname.name = child_name;
+    qname.len = strlen(child_name);
+    qname.hash = full_name_hash(parent_path.dentry, child_name, qname.len);
+
+    nm_enter();
+    child_dentry = d_hash_and_lookup(parent_path.dentry, &qname);
+
+    if (child_dentry && !IS_ERR(child_dentry)) {
+        d_invalidate(child_dentry);
+        d_drop(child_dentry);
+        dput(child_dentry);
+    }
+
+    nm_exit();
+    path_put(&parent_path);
+}
+
+static void nomount_flush_dcache(const char *path_name) {
+    struct path path;
+    char *parent_name, *last_slash, *child_name;
+    int err;
+
+    if (!path_name || NOMOUNT_DISABLED())
+        return;
+
+    nm_enter();
+    err = kern_path(path_name, LOOKUP_FOLLOW, &path);
+    
+    if (!err) {
+        d_invalidate(path.dentry);
+        d_drop(path.dentry);
+        nm_exit();
+        path_put(&path);
+        return;
+    }
+
+    if (err == -ENOENT) {
+        parent_name = kstrdup(path_name, GFP_KERNEL);
+        if (parent_name) {
+            last_slash = strrchr(parent_name, '/');
+            if (last_slash && last_slash != parent_name) {
+                *last_slash = '\0';
+                child_name = last_slash + 1;
+                nomount_flush_parent(parent_name, child_name);
+            }
+            kfree(parent_name);
+        }
+    }
+    nm_exit();
+}
+
+const char *nomount_get_static_vpath(struct inode *inode) {
+    struct nomount_rule *rule;
+    const char *path_ptr = NULL;
+
+    if (!inode || NOMOUNT_DISABLED()) return NULL;
+
+    rcu_read_lock();
+
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, inode->i_ino) {
+        if (rule->real_ino == inode->i_ino) {
+            path_ptr = rule->virtual_path;
+            break;
+        }
+    }
+
+    if (!path_ptr) {
+        hash_for_each_possible_rcu(nomount_rules_by_v_ino, rule, v_ino_node, inode->i_ino) {
+            if (rule->v_ino == inode->i_ino) {
+                path_ptr = rule->virtual_path;
+                break;
+            }
+        }
+    }
+
+    rcu_read_unlock();
+    return path_ptr;
+}
+EXPORT_SYMBOL(nomount_get_static_vpath);
+
+const char *nomount_get_static_vpath_readlink(struct inode *inode) {
+    struct nomount_rule *rule;
+    const char *path_ptr = NULL;
+
+    if (!inode || NOMOUNT_DISABLED()) return NULL;
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+        if (rule->real_ino == inode->i_ino || rule->v_ino == inode->i_ino) {
+            path_ptr = rule->virtual_path;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return path_ptr;
+}
+EXPORT_SYMBOL(nomount_get_static_vpath_readlink);
+
+static unsigned long nomount_get_inode_by_path(const char *path_str) {
+    struct path path;
+    unsigned long ino = 0;
+    unsigned int pflags;
+
+    if (!path_str) return 0;
+
+    pflags = memalloc_nofs_save();
+    nm_enter(); 
+    
+    if (kern_path(path_str, LOOKUP_FOLLOW, &path) == 0) {
+        if (path.dentry && d_backing_inode(path.dentry))
+            ino = d_backing_inode(path.dentry)->i_ino;
+        path_put(&path);
+    }
+    nm_exit();
+    memalloc_nofs_restore(pflags);
+    return ino;
+}
+
+bool nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino)
+{
+    struct nomount_rule *rule;
+    bool found = false;
+
+    if (!inode || !dev || !ino || NOMOUNT_DISABLED())
+        return false;
+
+    if (nomount_should_skip())
+        return false;
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, inode->i_ino) {
+        if (rule->real_ino == inode->i_ino) {
+            *dev = rule->v_dev;
+            *ino = rule->v_ino;
+            found = true;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    return found;
+}
+EXPORT_SYMBOL(nomount_spoof_mmap_metadata);
+
+static void nomount_refresh_critical_inodes(void) {
+    unsigned long current_adb = 0, current_mod = 0, ino = 0;
+    
+    if (unlikely(in_interrupt() || in_nmi() || oops_in_progress)) 
+        return;
+
+    if (current->flags & PF_MEMALLOC_NOFS) 
+        return;
+
+    current_adb = READ_ONCE(nm_ino_adb);
+    current_mod = READ_ONCE(nm_ino_modules);
+
+    if (current_adb == 0) {
+        ino = nomount_get_inode_by_path("/data/adb");
+        if (ino != 0) {
+            WRITE_ONCE(nm_ino_adb, ino);
+        }
+    }
+    
+    if (current_mod == 0) {
+        ino = nomount_get_inode_by_path("/data/adb/modules");
+        if (ino != 0) {
+            WRITE_ONCE(nm_ino_modules, ino);
+        }
+    }
+}
+
+bool nomount_is_traversal_allowed(struct inode *inode, int mask)
+{
+    struct nomount_rule *rule;
+    int i;
+
+    if (!inode || NOMOUNT_DISABLED())
+        return false;
+
+    if (!(mask & MAY_EXEC))
+        return false;
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+        for (i = 0; i < rule->parent_count; i++) {
+            if (rule->parent_inos[i] == inode->i_ino) {
+                rcu_read_unlock();
+                return true;
+            }
+        }
+    }
+    rcu_read_unlock();
+    return false;
+}
+EXPORT_SYMBOL(nomount_is_traversal_allowed);
+
+bool nomount_is_injected_file(struct inode *inode) {
+    struct nomount_rule *rule;
+    bool found = false;
+
+    if (!inode || NOMOUNT_DISABLED()) return false;
+    if (current->flags & PF_MEMALLOC_NOFS) return false;
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, inode->i_ino) {
+        if (rule->real_ino == inode->i_ino) {
+            found = true;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return found;
+}
+
+// delayed workqueue
+static void nomount_startup_check(struct work_struct *work);
+static DECLARE_DELAYED_WORK(nm_startup_work, nomount_startup_check);
+static void nomount_force_refresh_all(void);
+
+static void nomount_startup_check(struct work_struct *work) {
+    unsigned long adb_ino;
+
+    adb_ino = nomount_get_inode_by_path("/data/adb");
+
+    if (adb_ino != 0) {
+        nomount_refresh_critical_inodes();
+
+        if (READ_ONCE(nm_ino_adb) != 0) {
+            pr_info("NoMount: /data/adb stable. Processing rules...\n");
+            nomount_force_refresh_all();
+            pr_info("NoMount: System fully synchronized.\n");
+            return;
+        }
+    }
+
+    pr_info("NoMount: Waiting for /data...\n");
+    schedule_delayed_work(&nm_startup_work, msecs_to_jiffies(500));
+}
+
+char *nomount_resolve_path(const char *pathname) {
+    struct nomount_rule *rule;
+    u32 hash;
+
+    if (!pathname || NOMOUNT_DISABLED()) return NULL;
+
+    hash = full_name_hash(NULL, pathname, strlen(pathname));
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_rules_by_vpath, rule, vpath_node, hash) {
+        if (strcmp(pathname, rule->virtual_path) == 0) {
+            rcu_read_unlock();
+            return rule->real_path;
+        }
+    }
+    rcu_read_unlock();
+
+    return NULL;
+}
+EXPORT_SYMBOL(nomount_resolve_path);
+
+struct filename *nomount_getname_hook(struct filename *name)
+{
+    char *target_raw;
+    struct filename *new_name;
+    unsigned int pflags;
+
+    if (nomount_should_skip() || !name || !name->name) 
+        return name;
+
+    pflags = memalloc_nofs_save();
+    
+    /* Entramos en RCU para buscar la regla */
+    rcu_read_lock();
+    target_raw = nomount_resolve_path(name->name);
+    
+    if (!target_raw) {
+        rcu_read_unlock();
+        memalloc_nofs_restore(pflags);
+        return name;
+    }
+
+    new_name = getname_kernel(target_raw); 
+    rcu_read_unlock();
+
+    if (IS_ERR(new_name)) {
+        memalloc_nofs_restore(pflags);
+        return name;
+    }
+
+    new_name->uptr = name->uptr;
+    new_name->aname = name->aname;
+
+    putname(name); 
+    memalloc_nofs_restore(pflags);
+    return new_name;
+}
+
+static bool nomount_find_next_injection(unsigned long dir_ino, unsigned long v_index, char *name_out, unsigned char *type_out, unsigned long *fake_ino_out)
+{
+    struct nomount_dir_node *curr;
+    struct nomount_child_name *child;
+    bool found = false;
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_dirs_ht, curr, node, dir_ino) {
+        if (curr->dir_ino == dir_ino) {
+            list_for_each_entry_rcu(child, &curr->children_names, list) {
+                if (child->v_index == v_index) {
+                    strscpy(name_out, child->name, 256);
+                    *type_out = child->d_type;
+                    if (fake_ino_out)
+                        *fake_ino_out = child->fake_ino;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return found;
+}
+
+
+void nomount_inject_dents64(struct file *file, void __user **dirent, int *count, loff_t *pos)
+{
+    char name_buf[256]; 
+    unsigned char type_buf;
+    struct linux_dirent64 __user *curr_dirent;
+    unsigned long v_index, fake_ino, dir_ino;
+    int name_len, reclen;
+    struct dentry *parent, *check_dentry;
+    unsigned long child_fake_ino;
+
+    if (!file || !file->f_path.dentry || !d_backing_inode(file->f_path.dentry) ||
+        !dirent || !count || !pos) return;
+    if (nomount_should_skip() || nomount_is_uid_blocked(current_uid().val)) return;
+    if (unlikely(in_interrupt() || in_nmi() || oops_in_progress)) return;
+
+    parent = file->f_path.dentry;
+    dir_ino = d_backing_inode(parent)->i_ino;
+
+    if (*pos >= NOMOUNT_MAGIC_POS) {
+        unsigned long long diff = (unsigned long long)*pos - NOMOUNT_MAGIC_POS;
+        if (diff > 0x7FFFFFFF) {
+            v_index = 0;
+            *pos = NOMOUNT_MAGIC_POS;
+        } else {
+            v_index = (unsigned long)diff;
+        }
+    } else {
+        v_index = 0;
+        *pos = NOMOUNT_MAGIC_POS;
+    }
+
+    nm_enter();
+    while (1) {
+        child_fake_ino = 0;
+        if (!nomount_find_next_injection(dir_ino, v_index, name_buf, &type_buf, &child_fake_ino)) 
+            break;
+
+        name_len = strlen(name_buf);
+
+        check_dentry = lookup_one_len(name_buf, parent, name_len);
+        if (!IS_ERR(check_dentry)) {
+            bool exists = d_really_is_positive(check_dentry);
+            dput(check_dentry);
+            
+            if (exists) {
+                v_index++;
+                continue; 
+            }
+        }
+
+        reclen = ALIGN(offsetof(struct linux_dirent64, d_name) + name_len + 1, sizeof(u64));
+        if (*count < reclen) break;
+
+        curr_dirent = (struct linux_dirent64 __user *)*dirent;
+        fake_ino = child_fake_ino ? child_fake_ino : (unsigned long)full_name_hash(NULL, name_buf, name_len);
+
+        if (put_user(fake_ino, &curr_dirent->d_ino) ||
+            put_user(NOMOUNT_MAGIC_POS + v_index + 1, &curr_dirent->d_off) ||
+            put_user(reclen, &curr_dirent->d_reclen) ||
+            put_user(type_buf, &curr_dirent->d_type) ||
+            copy_to_user(curr_dirent->d_name, name_buf, name_len) ||
+            put_user(0, curr_dirent->d_name + name_len)) {
+            break;
+        }
+
+        *dirent = (void __user *)((char __user *)*dirent + reclen);
+        *count -= reclen;
+        *pos = NOMOUNT_MAGIC_POS + v_index + 1;
+        v_index++;
+    }
+    nm_exit();
+}
+
+void nomount_inject_dents(struct file *file, void __user **dirent, int *count, loff_t *pos)
+{
+    char name_buf[256]; 
+    unsigned char type_buf;
+    struct linux_dirent __user * curr_dirent;
+    unsigned long v_index, fake_ino, dir_ino;
+    int name_len, reclen;
+    struct dentry *parent, *check_dentry;
+
+    if (!file || !file->f_path.dentry || !d_backing_inode(file->f_path.dentry) ||
+        !dirent || !count || !pos) return;
+    if (nomount_should_skip() || nomount_is_uid_blocked(current_uid().val)) return;
+    if (unlikely(in_interrupt() || in_nmi() || oops_in_progress)) return;
+
+    parent = file->f_path.dentry;
+    dir_ino = d_backing_inode(parent)->i_ino;
+
+    if (*pos >= NOMOUNT_MAGIC_POS) {
+        unsigned long long diff = (unsigned long long)*pos - NOMOUNT_MAGIC_POS;
+        if (diff > 0x7FFFFFFF) {
+            v_index = 0;
+            *pos = NOMOUNT_MAGIC_POS;
+        } else {
+            v_index = (unsigned long)diff;
+        }
+    } else {
+        v_index = 0;
+        *pos = NOMOUNT_MAGIC_POS;
+    }
+    
+    nm_enter();
+    while (1) {
+        unsigned long child_fake_ino = 0;
+        if (!nomount_find_next_injection(dir_ino, v_index, name_buf, &type_buf, &child_fake_ino)) 
+            break;
+
+        name_len = strlen(name_buf);
+
+        check_dentry = lookup_one_len(name_buf, parent, name_len);
+        if (!IS_ERR(check_dentry)) {
+            bool exists = d_really_is_positive(check_dentry);
+            dput(check_dentry);
+            
+            if (exists) {
+                v_index++;
+                continue; 
+            }
+        }
+
+        reclen = ALIGN(offsetof(struct linux_dirent, d_name) + name_len + 2, 4);
+
+        if (*count < reclen) break;
+
+        curr_dirent = (struct linux_dirent __user *)*dirent;
+        fake_ino = child_fake_ino ? child_fake_ino : (unsigned long)full_name_hash(NULL, name_buf, name_len);
+ 
+        if (unlikely(put_user(fake_ino, &curr_dirent->d_ino) ||
+            put_user(NOMOUNT_MAGIC_POS + v_index + 1, &curr_dirent->d_off) ||
+            put_user(reclen, &curr_dirent->d_reclen) ||
+            copy_to_user(curr_dirent->d_name, name_buf, name_len) ||
+            put_user(0, curr_dirent->d_name + name_len) || 
+            put_user(type_buf, ((char __user *)curr_dirent) + reclen - 1))) {
+            break;
+        }
+
+        *dirent = (void __user *)((char __user *)*dirent + reclen);
+        *count -= reclen;
+        *pos = NOMOUNT_MAGIC_POS + v_index + 1;
+        v_index++;
+    }
+    nm_exit();
+}
+
+static void nomount_auto_inject_parent(const char *v_path, unsigned char type)
+{
+    char *parent_path, *name, *path_copy, *last_slash;
+    struct nomount_dir_node *dir_node = NULL, *curr;
+    struct nomount_child_name *child;
+    unsigned long parent_ino;
+    struct path path;
+
+    path_copy = kstrdup(v_path, GFP_KERNEL);
+    if (!path_copy) return;
+
+    last_slash = strrchr(path_copy, '/');
+    if (!last_slash || last_slash == path_copy) {
+        kfree(path_copy);
+        return;
+    }
+
+    *last_slash = '\0';
+    parent_path = path_copy;
+    name = last_slash + 1;
+
+    /* Try to get the REAL parent inode first */
+    parent_ino = 0;
+    {
+        struct nomount_rule *rule;
+        u32 parent_hash = full_name_hash(NULL, parent_path, strlen(parent_path));
+
+        rcu_read_lock();
+        hash_for_each_possible_rcu(nomount_rules_by_vpath, rule, vpath_node, parent_hash) {
+            if (strcmp(parent_path, rule->virtual_path) == 0) {
+                /* Parent is also a redirect - use real path's inode */
+                rcu_read_unlock();
+                nm_enter();
+                if (kern_path(rule->real_path, LOOKUP_FOLLOW, &path) == 0) {
+                    parent_ino = path.dentry->d_inode->i_ino;
+                    path_put(&path);
+                }
+                nm_exit();
+                goto found_parent_ino;
+            }
+        }
+        rcu_read_unlock();
+    }
+
+    /* Fallback: use virtual path's inode */
+    nm_enter();
+    if (kern_path(parent_path, LOOKUP_FOLLOW, &path) == 0) {
+        parent_ino = path.dentry->d_inode->i_ino;
+        path_put(&path);
+    } else {
+        parent_ino = (unsigned long)full_name_hash(NULL, parent_path, strlen(parent_path));
+    }
+
+found_parent_ino:
+    spin_lock(&nomount_lock);
+    hash_for_each_possible(nomount_dirs_ht, curr, node, parent_ino) {
+        if (curr->dir_ino == parent_ino) {
+            dir_node = curr;
+            break;
+        }
+    }
+
+    if (!dir_node) {
+        dir_node = kzalloc(sizeof(*dir_node), GFP_ATOMIC);
+        if (dir_node) {
+            INIT_LIST_HEAD(&dir_node->cleanup_list);
+            dir_node->dir_path = kstrdup(parent_path, GFP_ATOMIC);
+            dir_node->dir_ino = parent_ino;
+            INIT_LIST_HEAD(&dir_node->children_names);
+            dir_node->next_child_index = 0;
+            hash_add_rcu(nomount_dirs_ht, &dir_node->node, parent_ino);
+        }
+    }
+
+    if (dir_node) {
+        bool exists = false;
+        list_for_each_entry(child, &dir_node->children_names, list) {
+            if (strcmp(child->name, name) == 0) {
+                exists = true; break;
+            }
+        }
+        if (!exists) {
+            child = kzalloc(sizeof(*child), GFP_ATOMIC);
+            if (child) {
+                child->name = kstrdup(name, GFP_ATOMIC);
+                /* use DT_* macros for portability */
+                child->d_type = (type == DT_DIR) ? DT_DIR : DT_REG;
+                /* stable fake inode based on full virtual path */
+                child->fake_ino = (unsigned long)full_name_hash(NULL, v_path, strlen(v_path));
+                /* assign stable index under lock */
+                child->v_index = dir_node->next_child_index++;
+                list_add_tail_rcu(&child->list, &dir_node->children_names);
+            }
+        }
+    }
+    spin_unlock(&nomount_lock);
+    nm_exit();
+    kfree(path_copy);
+}
+
+ssize_t nomount_getxattr_hook(struct dentry *dentry, const char *name, void *value, size_t size)
+{
+    struct nomount_rule *rule;
+    struct path real_path;
+    const struct cred *old_cred;
+    struct cred *new_cred;
+    ssize_t ret;
+
+    if (nomount_should_skip() || !dentry || !dentry->d_inode)
+        return -EOPNOTSUPP;
+
+    rcu_read_lock();
+    // we check if this dentry is one of our injected files
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, dentry->d_inode->i_ino) {
+        if (rule->real_ino == dentry->d_inode->i_ino) {
+            rcu_read_unlock();
+            
+            // if it's an injected file, we redirect the request to the REAL file.
+            nm_enter();
+            if (kern_path(rule->real_path, LOOKUP_FOLLOW, &real_path) == 0) {
+                new_cred = prepare_creds();
+                if (new_cred) {
+                    new_cred->cap_effective = CAP_FULL_SET;
+                    new_cred->cap_permitted = CAP_FULL_SET;
+                    old_cred = override_creds(new_cred);
+                    /* we use __vfs_getxattr from the actual (source) file
+                        to skip SELinux and permissions checks */
+                    ret = __vfs_getxattr(real_path.dentry, real_path.dentry->d_inode, name, value, size);
+
+                    revert_creds(old_cred);
+                    put_cred(new_cred);
+                } else {
+                    ret = -ENOMEM;
+                }
+
+                path_put(&real_path);
+                nm_exit();
+                return ret;
+            }
+            nm_exit();
+            return -ENOENT;
+        }
+    }
+    rcu_read_unlock();
+
+    return -EOPNOTSUPP; // it is not a file injected by NoMount
+}
+EXPORT_SYMBOL(nomount_getxattr_hook);
+
+int nomount_setxattr_hook(struct dentry *dentry, const char *name, const void *value, size_t size, int flags)
+{
+    struct nomount_rule *rule;
+    struct path real_path;
+    const struct cred *old_cred;
+    struct cred *new_cred;
+    int ret;
+
+    if (nomount_should_skip() || !dentry || !dentry->d_inode)
+        return -EOPNOTSUPP;
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, dentry->d_inode->i_ino) {
+        if (rule->real_ino == dentry->d_inode->i_ino) {
+            rcu_read_unlock();
+
+            nm_enter();
+            if (kern_path(rule->real_path, LOOKUP_FOLLOW, &real_path) == 0) {
+                new_cred = prepare_creds();
+                if (new_cred) {
+                    new_cred->cap_effective = CAP_FULL_SET;
+                    new_cred->cap_permitted = CAP_FULL_SET;
+                    old_cred = override_creds(new_cred);
+
+                    /* redirect attribute writing to the source file 
+                        ignoring SELinux and permissions checks */
+                    ret = __vfs_setxattr_noperm(real_path.dentry, name, value, size, flags);
+
+                    revert_creds(old_cred);
+                    put_cred(new_cred);
+                } else {
+                    ret = -ENOMEM;
+                }
+                path_put(&real_path);
+                nm_exit();
+                return ret;
+            }
+            nm_exit();
+            return -ENOENT;
+        }
+    }
+    rcu_read_unlock();
+
+    return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(nomount_setxattr_hook);
+
+void nomount_spoof_stat(const struct path *path, struct kstat *stat)
+{
+    struct nomount_rule *rule;
+    struct inode *inode;
+
+    if (!path || !stat || nomount_should_skip()) return;
+
+    inode = d_backing_inode(path->dentry);
+    if (!inode) return;
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(nomount_rules_by_real_ino, rule, real_ino_node, inode->i_ino) {
+        if (rule->real_ino == inode->i_ino) {
+            stat->ino = rule->v_ino;
+            if (rule->v_dev != 0)
+                stat->dev = rule->v_dev;
+            break;
+        }
+    }
+    rcu_read_unlock();
+}
+
+void nomount_spoof_statfs(const struct path *path, struct kstatfs *buf)
+{
+    struct nomount_rule *rule;
+    struct inode *inode;
+    struct path v_path;
+
+    if (!path || !buf) return;
+
+    inode = d_backing_inode(path->dentry);
+    if (!inode) return;
+
+    nm_enter();
+    rcu_read_lock();
+    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+        if (rule->real_ino == inode->i_ino) {
+            rcu_read_unlock();
+            if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &v_path) == 0) {
+                buf->f_type = v_path.dentry->d_sb->s_magic;
+                path_put(&v_path);
+            }
+            
+            nm_exit();
+            return;
+        }
+    }
+    rcu_read_unlock();
+    nm_exit();
+}
+
+/* Forces cache flushing for all active rules. */
+static void __nomount_force_refresh_all_unsafe(void) {
+    struct nomount_rule *rule;
+    
+    nm_enter();
+    rcu_read_lock();
+    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+        if (rule->virtual_path) {
+            nomount_flush_dcache(rule->virtual_path);
+        }
+    }
+    rcu_read_unlock();
+    nm_exit();
+}
+
+static void nomount_force_refresh_all(void) {
+    if (!mutex_trylock(&nm_refresh_lock))
+        return;
+    
+    __nomount_force_refresh_all_unsafe();
+    
+    mutex_unlock(&nm_refresh_lock);
+}
+
+static void nomount_collect_parent_inodes(struct nomount_rule *rule)
+{
+    char *path, *p;
+    struct path kern_p;
+    int count = 0;
+
+    path = kstrdup(rule->real_path, GFP_KERNEL);
+    if (!path)
+        return;
+
+    p = path;
+
+    while (count < NM_MAX_PARENTS) {
+        char *slash = strrchr(p, '/');
+        if (!slash || slash == p)
+            break;
+
+        *slash = '\0';
+
+        if (kern_path(p, LOOKUP_FOLLOW, &kern_p) == 0) {
+            rule->parent_inos[count++] =
+                d_backing_inode(kern_p.dentry)->i_ino;
+            path_put(&kern_p);
+        }
+    }
+
+    rule->parent_count = count;
+    kfree(path);
+}
+
+static int nomount_ioctl_add_rule(unsigned long arg)
+{
+    struct nomount_ioctl_data data;
+    struct nomount_rule *rule;
+    char *v_path, *r_path, *parent, *slash;
+    struct path path;
+    struct kstatfs tmp_stfs;
+    unsigned char type;
+    u32 hash, search_hash;
+
+    if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+        return -EFAULT;
+    if (!capable(CAP_SYS_ADMIN)) return -EPERM;
+
+    nm_enter();
+    v_path = strndup_user(data.virtual_path, PATH_MAX);
+    if (IS_ERR(v_path)) {
+        nm_exit(); 
+        return PTR_ERR(v_path);
+    }
+    r_path = strndup_user(data.real_path, PATH_MAX);
+    if (IS_ERR(r_path)) {
+        nm_exit();
+        kfree(v_path);
+        return PTR_ERR(r_path);
+    }
+
+    hash = full_name_hash(NULL, v_path, strlen(v_path));
+    rule = kzalloc(sizeof(*rule), GFP_KERNEL);
+    if (!rule) {
+        nm_exit();
+        kfree(v_path); kfree(r_path);
+        return -ENOMEM;
+    }
+   
+    rule->virtual_path = v_path;
+    rule->vp_len = strlen(v_path);
+    rule->real_path = r_path;
+    rule->flags = data.flags | NM_FLAG_ACTIVE;
+    rule->is_new = false;
+
+    if (nm_ino_adb == 0) {
+        nomount_refresh_critical_inodes();
+    }
+
+    if (kern_path(v_path, LOOKUP_FOLLOW, &path) == 0) {
+        rule->v_dev = path.dentry->d_sb->s_dev;
+        rule->v_ino = path.dentry->d_inode->i_ino;
+        
+        if (path.dentry->d_sb->s_op->statfs) {
+            path.dentry->d_sb->s_op->statfs(path.dentry, &tmp_stfs);
+            rule->v_fs_type = tmp_stfs.f_type;
+        } else {
+            rule->v_fs_type = path.dentry->d_sb->s_magic;
+        }
+        path_put(&path);
+    } else {
+        struct path p_path;
+        parent = kstrdup(v_path, GFP_KERNEL);
+        slash = parent ? strrchr(parent, '/') : NULL;
+
+        if (parent && slash) {
+            if (slash == parent) *(slash + 1) = '\0';
+            else *slash = '\0';
+
+            if (kern_path(parent, LOOKUP_FOLLOW, &p_path) == 0) {
+                rule->v_dev = p_path.dentry->d_sb->s_dev;
+                rule->v_fs_type = p_path.dentry->d_sb->s_magic;
+                path_put(&p_path);
+            }
+        }
+        kfree(parent);
+        
+        if (rule->v_fs_type == 0) rule->v_fs_type = 0xEF53; 
+
+        rule->v_ino = (unsigned long)full_name_hash(NULL, v_path, strlen(v_path));
+    #ifdef CONFIG_64BIT
+        rule->v_ino = (0x4E4D0000UL << 32) | (u32)rule->v_ino;
+    #endif
+    }
+
+    if (kern_path(r_path, LOOKUP_FOLLOW, &path) == 0) {
+        rule->real_ino = path.dentry->d_inode->i_ino;
+        rule->real_dev = path.dentry->d_sb->s_dev;
+        path_put(&path);
+        nomount_collect_parent_inodes(rule);
+    } else {
+        rule->real_ino = 0;
+    }
+
+    search_hash = full_name_hash(NULL, v_path, strlen(v_path));
+    
+    spin_lock(&nomount_lock);
+    hash_add_rcu(nomount_rules_by_vpath, &rule->vpath_node, full_name_hash(NULL, rule->virtual_path, rule->vp_len));
+
+    if (rule->real_ino)
+        hash_add_rcu(nomount_rules_by_real_ino, &rule->real_ino_node, rule->real_ino);
+
+    if (rule->v_ino)
+        hash_add_rcu(nomount_rules_by_v_ino, &rule->v_ino_node, rule->v_ino);
+
+    list_add_tail(&rule->list, &nomount_rules_list);
+    spin_unlock(&nomount_lock);
+
+    type = DT_REG; 
+    if (data.flags & NM_FLAG_IS_DIR) type = DT_DIR;
+
+    if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &path) != 0) {
+        nomount_auto_inject_parent(rule->virtual_path, type);
+        rule->is_new = true;
+    } else {
+        path_put(&path);
+    }
+   
+    nomount_flush_dcache(rule->virtual_path);
+    nm_exit();
+    return 0;
+}
+
+static int nomount_ioctl_del_rule(unsigned long arg)
+{
+    struct nomount_ioctl_data data;
+    struct nomount_rule *rule, *victim = NULL;
+    struct hlist_node *tmp;
+    char *v_path;
+    u32 hash;
+
+    if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+        return -EFAULT;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+
+    v_path = strndup_user(data.virtual_path, PATH_MAX);
+    if (IS_ERR(v_path))
+        return PTR_ERR(v_path);
+
+    hash = full_name_hash(NULL, v_path, strlen(v_path));
+
+    spin_lock(&nomount_lock);
+    hash_for_each_possible_safe(nomount_rules_by_vpath,
+                                rule, tmp, vpath_node, hash) {
+        if (strcmp(rule->virtual_path, v_path) == 0) {
+            rule->flags &= ~NM_FLAG_ACTIVE;
+            hash_del_rcu(&rule->vpath_node);
+            if (rule->real_ino)
+                hash_del_rcu(&rule->real_ino_node);
+            if (rule->v_ino)
+                hash_del_rcu(&rule->v_ino_node);
+            list_del_rcu(&rule->list);
+            victim = rule;
+            break;
+        }
+    }
+    spin_unlock(&nomount_lock);
+
+    if (victim) {
+        nomount_flush_dcache(v_path);
+
+        synchronize_rcu();
+        kfree(victim->virtual_path);
+        kfree(victim->real_path);
+        kfree(victim);
+        
+        kfree(v_path);
+        return 0;
+    }
+
+    kfree(v_path);
+    return -ENOENT;
+}
+
+static int nomount_ioctl_clear_rules(void)
+{
+    struct nomount_rule *rule, *tmp_rule;
+    struct nomount_uid_node *uid_node, *tmp_uid;
+    struct nomount_dir_node *dir_node, *tmp_dir;
+    struct nomount_child_name *child, *tmp_child;
+    struct hlist_node *hlist_tmp;
+    LIST_HEAD(rule_victims);
+    LIST_HEAD(uid_victims);
+    LIST_HEAD(dir_victims);
+    int bkt;
+    
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    
+    if (!mutex_trylock(&nm_refresh_lock))
+        return -EBUSY;
+
+    spin_lock(&nomount_lock);
+    list_for_each_entry_safe(rule, tmp_rule, &nomount_rules_list, list) {
+        hash_del_rcu(&rule->vpath_node);
+        if (rule->real_ino)
+            hash_del_rcu(&rule->real_ino_node);
+        if (rule->v_ino)
+            hash_del_rcu(&rule->v_ino_node);
+
+        list_del_rcu(&rule->list);
+        list_add_tail(&rule->cleanup_list, &rule_victims);
+        rule->flags &= ~NM_FLAG_ACTIVE;
+    }
+
+    hash_for_each_safe(nomount_uid_ht, bkt, hlist_tmp, uid_node, node) {
+        hash_del_rcu(&uid_node->node);
+        list_add_tail(&uid_node->cleanup_list, &uid_victims);
+    }
+
+    hash_for_each_safe(nomount_dirs_ht, bkt, hlist_tmp, dir_node, node) {
+        hash_del_rcu(&dir_node->node);
+        list_add_tail(&dir_node->cleanup_list, &dir_victims);
+    }
+    
+    spin_unlock(&nomount_lock);
+
+    synchronize_rcu();
+
+    list_for_each_entry_safe(dir_node, tmp_dir, &dir_victims, cleanup_list) {
+        list_del(&dir_node->cleanup_list);
+
+        list_for_each_entry_safe(child, tmp_child, &dir_node->children_names, list) {
+            list_del(&child->list);
+            kfree(child->name);
+            kfree(child);
+        }
+        
+        kfree(dir_node->dir_path);
+        kfree(dir_node);
+    }
+
+    list_for_each_entry_safe(rule, tmp_rule, &rule_victims, cleanup_list) {
+        list_del(&rule->cleanup_list);
+
+        if (rule->virtual_path) {
+            nomount_flush_dcache(rule->virtual_path);
+        }
+        
+        kfree(rule->virtual_path);
+        kfree(rule->real_path);
+        kfree(rule);
+    }
+
+    list_for_each_entry_safe(uid_node, tmp_uid, &uid_victims, cleanup_list) {
+        list_del(&uid_node->cleanup_list);
+        kfree(uid_node);
+    }
+    
+    mutex_unlock(&nm_refresh_lock);
+    return 0;
+}
+
+static int nomount_ioctl_list_rules(unsigned long arg)
+{
+    struct nomount_rule *rule;
+    char *kbuf;
+    size_t len = 0;
+    const size_t max_size = MAX_LIST_BUFFER_SIZE;
+    int ret = 0;
+
+    kbuf = vmalloc(max_size);
+    if (!kbuf) return -ENOMEM;
+
+    memset(kbuf, 0, max_size);
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+        size_t entry_len = strlen(rule->virtual_path) + strlen(rule->real_path) + 4; // "->", "\n" and null
+
+        if (len + entry_len >= max_size - 1)
+            break;
+
+        len += scnprintf(kbuf + len, max_size - len, "%s->%s\n", 
+                         rule->virtual_path, rule->real_path);
+    }
+    rcu_read_unlock();
+
+    if (len > 0) {
+        if (copy_to_user((void __user *)arg, kbuf, len))
+            ret = -EFAULT;
+        else
+            ret = len; // We return the number of bytes written
+    } else {
+        ret = 0; // Empty list
+    }
+
+    vfree(kbuf);
+    return ret;
+}
+
+static int nomount_ioctl_add_uid(unsigned long arg)
+{
+    unsigned int uid;
+    struct nomount_uid_node *entry;
+
+    if (copy_from_user(&uid, (void __user *)arg, sizeof(uid)))
+        return -EFAULT;
+    
+    if (nomount_is_uid_blocked(uid)) return -EEXIST;
+
+    entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry) return -ENOMEM;
+
+    entry->uid = uid;
+    
+    spin_lock(&nomount_lock);
+    hash_add_rcu(nomount_uid_ht, &entry->node, uid);
+    spin_unlock(&nomount_lock);
+    
+    return 0;
+}
+
+static int nomount_ioctl_del_uid(unsigned long arg)
+{
+    unsigned int uid;
+    struct nomount_uid_node *entry;
+    struct hlist_node *tmp;
+    int bkt;
+    bool found = false;
+
+    if (copy_from_user(&uid, (void __user *)arg, sizeof(uid)))
+        return -EFAULT;
+
+    spin_lock(&nomount_lock);
+    hash_for_each_safe(nomount_uid_ht, bkt, tmp, entry, node) {
+        if (entry->uid == uid) {
+            hash_del_rcu(&entry->node);
+            found = true;
+            break; 
+        }
+    }
+    spin_unlock(&nomount_lock);
+
+    if (found && entry) {
+        kfree(entry); 
+    }
+
+    return found ? 0 : -ENOENT;
+}
+
+static long nomount_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    if (_IOC_TYPE(cmd) != NOMOUNT_MAGIC_CODE)
+        return -ENOTTY;
+    switch (cmd) {
+    case NOMOUNT_IOC_GET_VERSION: return NOMOUNT_VERSION;
+    case NOMOUNT_IOC_ADD_RULE: return nomount_ioctl_add_rule(arg);
+    case NOMOUNT_IOC_DEL_RULE: return nomount_ioctl_del_rule(arg);
+    case NOMOUNT_IOC_CLEAR_ALL: return nomount_ioctl_clear_rules();
+    case NOMOUNT_IOC_ADD_UID: return nomount_ioctl_add_uid(arg);
+    case NOMOUNT_IOC_DEL_UID: return nomount_ioctl_del_uid(arg);
+    case NOMOUNT_IOC_GET_LIST: return nomount_ioctl_list_rules(arg);
+    case NOMOUNT_IOC_REFRESH: 
+        nomount_force_refresh_all();
+        return 0;
+    default: return -EINVAL;
+    }
+}
+
+static const struct file_operations nomount_fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = nomount_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = nomount_ioctl,
+#endif
+};
+
+static struct miscdevice nomount_device = {
+    .minor = MISC_DYNAMIC_MINOR, 
+    .name = "nomount", 
+    .fops = &nomount_fops, 
+    .mode = 0600,
+};
+
+static int __init nomount_init(void) {
+    int ret;
+    spin_lock_init(&nomount_lock);
+
+    /* Initialize hash tables */
+    hash_init(nomount_rules_by_vpath);
+    hash_init(nomount_rules_by_real_ino);
+    hash_init(nomount_rules_by_v_ino);
+    hash_init(nomount_dirs_ht);
+    hash_init(nomount_uid_ht);
+
+    ret = misc_register(&nomount_device);
+    if (ret) return ret;
+    atomic_set(&nomount_enabled, 1);
+    pr_info("NoMount: Loaded\n");
+    schedule_delayed_work(&nm_startup_work, msecs_to_jiffies(500));
+    return 0;
+}
+
+fs_initcall(nomount_init);
